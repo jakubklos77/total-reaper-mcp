@@ -612,18 +612,41 @@ def register_dsl_tools(mcp):
             - "save"
             - "save as Final Mix"
         """
+        # Save to a concrete .rpp path via Main_SaveProjectEx so REAPER NEVER
+        # pops a modal "Save As" dialog — a dialog blocks the single-threaded
+        # bridge and hangs every subsequent MCP call until dismissed. A named
+        # save lands in ~/Music/REAPER Projects/<name>.rpp; an unnamed save
+        # re-saves the current project file if it already has one, else falls
+        # back to a default path.
+        import os as _os
         try:
-            from server.tools.project import save_project
-            
-            # For now, just do regular save
-            # TODO: Add save-as functionality when available
-            result = await save_project(0, force_save_as=bool(name))
-            
+            proj_dir = _os.environ.get(
+                'REAPER_MCP_PROJECT_DIR',
+                _os.path.expanduser('~/Music/REAPER Projects'))
+            _os.makedirs(proj_dir, exist_ok=True)
+
+            target = None
             if name:
-                return f"Saved project (save-as functionality pending)"
+                safe = "".join(c for c in name if c not in '/\\:*?"<>|').strip() or "Untitled"
+                if not safe.lower().endswith('.rpp'):
+                    safe += '.rpp'
+                target = safe if _os.path.isabs(safe) else _os.path.join(proj_dir, safe)
             else:
-                return "Project saved"
-                
+                # No name: reuse the current project's own file if it has one.
+                cur = await bridge.call_lua("EnumProjects", [-1, ""])
+                cur_path = ""
+                if isinstance(cur, dict) and cur.get("ok"):
+                    ret = cur.get("ret")
+                    if isinstance(ret, list) and len(ret) > 1 and isinstance(ret[1], str):
+                        cur_path = ret[1]
+                    elif isinstance(ret, str):
+                        cur_path = ret
+                target = cur_path if cur_path.lower().endswith('.rpp') else _os.path.join(proj_dir, 'Untitled.rpp')
+
+            result = await bridge.call_lua("Main_SaveProjectEx", [0, target, 0])
+            if isinstance(result, dict) and not result.get("ok", False):
+                return f"Failed to save project: {result.get('error', 'unknown')}"
+            return f"Saved project to {target}"
         except Exception as e:
             return f"Failed to save project: {str(e)}"
     
