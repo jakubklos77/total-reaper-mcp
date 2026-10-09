@@ -81,8 +81,7 @@ cmd /c mklink /D "C:\Program Files\REAPER (x64)\total-reaper-mcp" "Y:\music\tota
 ## 4. Install the Lua bridge into REAPER
 
 ```bash
-cp "/cygdrive/c/Program Files/REAPER (x64)/total-reaper-mcp/lua/mcp_bridge.lua" \
-   /cygdrive/c/Users/Jakub/AppData/Roaming/REAPER/Scripts/
+cmd /c mklink "C:\Users\Jakub\AppData\Roaming\REAPER\Scripts" "Y:\music\total-reaper-mcp\lua\mcp_bridge.lua"
 ```
 
 Start it automatically with REAPER, without the console popup. Create
