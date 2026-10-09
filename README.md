@@ -86,6 +86,12 @@ The live tests run in a fresh **scratch project tab**. At the end the tab is sav
 `skills/reaper-tempo-sync` builds a tempo map that follows a freely played (rubato) MIDI
 performance. DAW bars and beats then line up with the notes, while playback stays exactly as performed.
 
+`skills/reaper-performance-cleanup` cleans up a played take. It deletes slips, ghost presses and
+double strikes and flags wrong notes. Before tempo sync it cuts out thinking pauses; after it, it pulls small
+timing errors towards the synced grid. Pipeline: cleanup (notes, pauses) → tempo sync → cleanup (timing).
+
+Offline tests for the skills' analysis code are in `tests/skills/`.
+
 ## Origin
 
 This is a fork of [shiehn/total-reaper-mcp](https://github.com/shiehn/total-reaper-mcp), rebuilt from scratch on top of

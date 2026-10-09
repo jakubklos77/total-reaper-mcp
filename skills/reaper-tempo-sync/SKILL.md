@@ -10,6 +10,10 @@ it sounds**: a tempo marker goes on every played beat (square shape), and all ev
 written back at their original absolute times. Afterwards beats/bars match the notes, so
 quantising, editing, notation and adding other parts work against the real pulse.
 
+**Pipeline with reaper-performance-cleanup:** remove thinking pauses and slips *before* this
+skill (`cleanup.py --apply notes,pauses`), and tighten timing *after* it (`--apply timing`).
+A pause would otherwise show up here as a very slow beat or extra bars.
+
 ## Requirements
 
 - REAPER running with the MCP bridge script and the `reaper-daw` MCP server (this repo); the
