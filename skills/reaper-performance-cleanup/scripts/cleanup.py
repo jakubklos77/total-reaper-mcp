@@ -1,44 +1,37 @@
 #!/usr/bin/env python3
 """
-cleanup.py - clean up a freely played MIDI take in the OPEN REAPER project via the Reaper MCP
-server: wrong notes / slips, thinking pauses, small timing errors.
+cleanup.py - map a freely played MIDI take in the OPEN REAPER project and fix its accidents
+(ghost presses, slips, double strikes, split chords) via the Reaper MCP server.
 
-  dry run (default)        report everything found, change nothing
-  --apply notes,pauses     before tempo sync: fix notes, cut thinking pauses
-  --apply timing           after tempo sync: pull onsets towards the synced grid
+  dry run (default)        piece map + every finding, change nothing
+  --apply                  apply the auto findings (+ --include, - --exclude, --raise)
   --restore BACKUP.json    put the take back exactly as it was
 
 Output: human-readable lines plus a final line "RESULT {json}".
 """
-import argparse, json, os, sys, time
+import argparse, bisect, json, os, sys, time
 from mcp_client import MCPClient
-from cleanup_analysis import (parse_notes, find_note_fixes, apply_note_fixes, find_pauses, pause_cuts,
-                              cut_warp, timing_plan, anchor_warp, onset_deviation)
+from piece import parse, piece_map, find_fixes, apply_fixes, NAMES
 
 BACKUP_DIR = os.path.expanduser("~/.cache/reaper-performance-cleanup")
-STEPS = ("notes", "pauses", "timing")
+KINDS = ("ghost", "slip", "double", "split", "wrong")
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--item", type=int, default=0, help="project-wide media item index")
 mode = ap.add_mutually_exclusive_group()
-mode.add_argument("--apply", metavar="STEPS", help="comma list of notes,pauses,timing (default: dry run)")
+mode.add_argument("--apply", action="store_true", help="apply the selected findings (default: dry run)")
 mode.add_argument("--restore", metavar="BACKUP", help="restore the take from a backup file")
-ap.add_argument("--include", default="", help="also apply these review findings, e.g. N1,N4")
-ap.add_argument("--exclude", default="", help="skip these findings, e.g. N3")
-ap.add_argument("--ghost-vel", type=int, default=8, help="velocity at or below which a note counts as a ghost")
-ap.add_argument("--slots-per-beat", type=int, default=2, help="played subdivision per beat (2=eighths, 3=triplets, 4=16ths)")
-ap.add_argument("--min-pause", type=float, default=1.5, help="shortest pause in seconds")
-ap.add_argument("--pause-beats", type=float, default=3.0, help="shortest pause in local beats")
-ap.add_argument("--keep-beats", type=float, default=1.0, help="beats left of each pause after the cut")
-ap.add_argument("--keep", default="", help="per pause, e.g. P1=2,P3=0.5 (beats)")
-ap.add_argument("--grid", type=float, help="timing grid in quarter notes (default 1/slots-per-beat)")
-ap.add_argument("--strength", type=float, default=0.5, help="timing: 0..1 of the distance to the grid")
-ap.add_argument("--window", type=float, default=0.35, help="timing: only onsets within this fraction of a grid step")
+ap.add_argument("--include", default="", help="also apply these review findings, e.g. N35,N66")
+ap.add_argument("--exclude", default="", help="skip findings by id or kind, e.g. N8,split")
+ap.add_argument("--raise", dest="raise_", default="", help="ghosts to make audible instead of deleting, e.g. N4,N48")
+ap.add_argument("--ghost-vel", type=int, default=8, help="velocity at or below which a press is inaudible")
+ap.add_argument("--free-gap", type=float, default=0.8,
+                help="median onset gap (s) from which a passage counts as free/rubato (no pulse)")
 a = ap.parse_args()
 
 
 def ids(s):
-    return {x.strip().upper() for x in s.split(",") if x.strip()}
+    return {x.strip() for x in s.split(",") if x.strip()}
 
 
 def result(**kw):
@@ -46,7 +39,18 @@ def result(**kw):
 
 
 def public(f):
-    return {k: v for k, v in f.items() if k not in ("note", "into") and not k.startswith("_")}
+    return {k: v for k, v in f.items() if k not in ("note", "into")}
+
+
+def to_ppq(t, sec, ppq):
+    """Seconds -> ticks by interpolating the take's own (sec, ppq) pairs (exact at an event's own
+    time and between tempo changes)."""
+    i = min(max(bisect.bisect_left(sec, t), 1), len(sec) - 1)
+    if sec[i] == t: return ppq[i]
+    j = i - 1
+    while j > 0 and sec[i] - sec[j] < 1e-6: j -= 1
+    while i < len(sec) - 1 and sec[i] - sec[j] < 1e-6: i += 1
+    return round(ppq[j] + (t - sec[j]) * (ppq[i] - ppq[j]) / ((sec[i] - sec[j]) or 1))
 
 
 m = MCPClient()
@@ -54,114 +58,69 @@ try:
     if a.restore:
         b = json.load(open(a.restore))
         m.call("midi_set", item=b["item"], unit="ppq", events=[[e[0], e[1], e[2]] for e in b["events"]])
-        m.call("item_set", item=b["item"], length=b["item_length"])
         after = m.call("midi_get", item=b["item"], notes=False, ccs=False, events=True)["events"]
         same = [e[:3] for e in after] == [e[:3] for e in b["events"]]
         print(f"restored {len(after)} events from {a.restore}; identical={same}")
         result(mode="restore", ok=same, events=len(after))
         sys.exit(0 if same else 1)
 
-    steps = ids(a.apply.lower()) if a.apply else set()
-    steps = {s.lower() for s in steps}
-    if steps - set(STEPS):
-        result(mode="error", error=f"unknown step(s) {sorted(steps - set(STEPS))}; use {','.join(STEPS)}"); sys.exit(2)
-    if {"pauses", "timing"} <= steps:
-        result(mode="error", error="pauses (before tempo sync) and timing (after it) can't run together"); sys.exit(2)
-
     take = m.call("midi_get", item=a.item, notes=False, ccs=False, events=True)
-    tm = m.call("tempo_map_get")
-    synced = len(tm["markers"]) > 1
     events = take["events"]                  # [ppq, flags, hex, sec, qn]
-    item_len = take["item_length"]
-    item_pos = take["item_position"]
-    inc, exc = ids(a.include), ids(a.exclude)
-    keep = {k.strip().upper(): float(v) for k, v in (x.split("=") for x in a.keep.split(",") if "=" in x)}
-    grid = a.grid or 1.0 / a.slots_per_beat
-    report = {"item": a.item, "events": len(events), "tempo_synced": synced}
+    sec = [e[3] for e in events]
+    notes, pedal = parse(events, sec)
+    pm = piece_map(notes, ghost_vel=a.ghost_vel, free_ioi=a.free_gap)
 
-    # ---------- notes ----------
-    fixes = find_note_fixes(parse_notes(events, [e[3] for e in events]), ghost_vel=a.ghost_vel)
-    chosen = [f for f in fixes if (f["auto"] or f["id"] in inc) and f["id"] not in exc]
-    report["note_findings"] = [public(f) for f in fixes]
-    report["note_fixes_selected"] = [f["id"] for f in chosen]
-    print(f"{len(fixes)} note findings, {len(chosen)} selected:")
+    # ---------- piece map ----------
+    k = pm["key"]
+    print(f"key: {k['name']} (fit {k['confidence']}); in key: {' '.join(NAMES[p] for p in k['scale'])}")
+    if pm["pulse_sec"]:
+        p = pm["pulse_sec"]
+        print(f"main pulse: one onset every {p:.3f} s -> if eighths: quarter = {60 / p / 2:.0f} BPM "
+              f"(if sixteenths: {60 / p / 4:.0f}, if quarters: {60 / p:.0f})")
+    print("sections:")
+    for s in pm["sections"]:
+        tempo = f", pulse {s['pulse_sec']:.3f} s (quarter {60 / s['pulse_sec'] / 2:.0f} BPM as eighths)" if s["pulse_sec"] else ""
+        print(f"  {s['start']:7.2f} - {s['end']:7.2f} s  {s['kind']:6}  {s['onsets']:4} onsets, "
+              f"median gap {s['median_gap_sec']} s{tempo}")
+
+    # ---------- findings ----------
+    inc, exc, rai = ids(a.include), ids(a.exclude), ids(a.raise_)
+    bad = {x for x in exc if not x.startswith("N") and x not in KINDS}
+    if bad:
+        result(mode="error", error=f"unknown kind(s) {sorted(bad)} in --exclude; kinds are {','.join(KINDS)}"); sys.exit(2)
+    fixes = find_fixes(notes, pm, ghost_vel=a.ghost_vel)
+    chosen = [f for f in fixes if (f["auto"] or f["id"] in inc or f["id"] in rai)
+              and f["id"] not in exc and f["kind"] not in exc]
+    print(f"{len(fixes)} findings, {len(chosen)} selected ([x]):")
     for f in fixes:
-        what = {"delete": "delete", "velocity": f"velocity -> {f.get('new_vel')}",
-                "transpose": f"-> {f.get('to')}", "merge": "merge"}[f["action"]]
-        mark = "x" if f in chosen else " "
-        print(f"  [{mark}] {f['id']:4} {f['time']:8.3f}s {f['pitch']:4} vel {f['vel']:3} {f['dur_ms']:5} ms  "
-              f"{f['kind']:6} {what:16} {'auto' if f['auto'] else 'review'}  - {f['why']}")
-    work = apply_note_fixes(events, chosen) if "notes" in steps else [list(e) for e in events]
-
-    # ---------- pauses (before sync, on the note-fixed take) ----------
-    pauses = find_pauses(parse_notes(work, [e[3] for e in work]), a.slots_per_beat, a.min_pause,
-                         a.pause_beats, a.keep_beats, keep)
-    pauses = [p for p in pauses if p["id"] not in exc]
-    report["pauses"] = [public(p) for p in pauses]
-    report["pause_removed_sec"] = round(sum(p["removed_sec"] for p in pauses), 3)
-    print(f"{len(pauses)} thinking pauses" + (" (remove BEFORE tempo sync)" if pauses and synced else ""))
-    for p in pauses:
-        print(f"  {p['id']:3} after {p['time']:8.3f}s: {p['gap_sec']:.2f}s = {p['gap_beats']} beats "
-              f"-> keep {p['keep_beats']:g} beat(s) = {p['new_gap_sec']:.2f}s (cut {p['removed_sec']:.2f}s)")
-
-    # ---------- timing (after sync) ----------
-    moves = []
-    if synced:
-        nq = parse_notes(work, [e[4] for e in work])
-        moves, anchors = timing_plan(nq, grid, a.strength, a.window)
-        report["timing_before"] = onset_deviation(nq, grid)
-        report["timing_moves"] = len(moves)
-        report["timing_max_shift_qn"] = max((abs(x["shift_qn"]) for x in moves), default=0)
-        print(f"timing: grid {grid:g} qn, onsets off-grid median {report['timing_before']['median_dev_qn']} qn; "
-              f"{len(moves)} onsets would move (strength {a.strength}, max {report['timing_max_shift_qn']} qn)")
-    else:
-        print("timing: needs the tempo-synced grid - run reaper-tempo-sync first")
-
-    if not steps:
+        if f["kind"] == "ghost" and f["id"] in rai: what = f"velocity -> {f['raise_to']}"
+        else: what = {"delete": "delete", "merge": "merge", "transpose": f"-> {f.get('to')}",
+                      "move": f"move {f.get('shift_ms', 0):+d} ms"}[f["action"]]
+        hint = f"  [--raise {f['id']}: velocity {f['raise_to']}]" if f.get("raise_to") and f["id"] not in rai else ""
+        print(f"  [{'x' if f in chosen else ' '}] {f['id']:4} {f['time']:8.3f}s {f['pitch']:4} vel {f['vel']:3} "
+              f"{f['dur_ms']:5} ms  {f['kind']:6} {what:14} {'auto' if f['auto'] else 'REVIEW'}  - {f['why']}{hint}")
+    report = {"item": a.item, "events": len(events), "key": k["name"], "pulse_sec": pm["pulse_sec"],
+              "sections": pm["sections"], "findings": [public(f) for f in fixes],
+              "selected": [f["id"] for f in chosen]}
+    if not a.apply:
         result(mode="dry-run", **report); sys.exit(0)
 
     # ---------- apply ----------
-    if "pauses" in steps and synced:
-        result(mode="error", error="the project has a tempo map: remove pauses before tempo sync "
-                                   "(restore the tempo-sync backup, clean up, then sync again)"); sys.exit(2)
-    if "timing" in steps and not synced:
-        result(mode="error", error="timing needs the tempo-synced grid - run reaper-tempo-sync first"); sys.exit(2)
-
     os.makedirs(BACKUP_DIR, exist_ok=True)
     backup = os.path.join(BACKUP_DIR, time.strftime("%Y%m%d-%H%M%S") + f"-item{a.item}.json")
-    json.dump({"item": a.item, "item_length": item_len, "events": events, "steps": sorted(steps)}, open(backup, "w"))
-
-    new_len = item_len
-    if "pauses" in steps and pauses:
-        w = cut_warp(pause_cuts(pauses))
-        out = [[w(e[3]), e[1], e[2]] for e in work]
-        new_len = w(item_pos + item_len) - item_pos
-        unit = "seconds"
-    elif "timing" in steps and moves:
-        w = anchor_warp(anchors)
-        out = [[w(e[4]), e[1], e[2]] for e in work]
-        unit = "qn"
-    else:
-        out = [[e[0], e[1], e[2]] for e in work]
-        unit = "ppq"
-    m.call("midi_set", item=a.item, unit=unit, events=out)
-    if abs(new_len - item_len) > 1e-6:
-        m.call("item_set", item=a.item, length=new_len)
+    json.dump({"item": a.item, "events": events, "applied": [public(f) for f in chosen]}, open(backup, "w"))
+    ppq = [e[0] for e in events]
+    out = [[to_ppq(t, sec, ppq), fl, h] for t, fl, h in apply_fixes(events, sec, chosen, raise_ids=rai)]
+    m.call("midi_set", item=a.item, unit="ppq", events=out)
 
     # ---------- verify ----------
     after = m.call("midi_get", item=a.item, notes=False, ccs=False, events=True)["events"]
-    col = {"seconds": 3, "qn": 4, "ppq": 0}[unit]
-    tol = {"seconds": 0.002, "qn": 0.005, "ppq": 0.5}[unit]
-    same_payload = sorted((e[1], e[2]) for e in out) == sorted((e[1], e[2]) for e in after)
-    worst = max((abs(x[0] - y[col]) for x, y in zip(sorted(out, key=lambda e: (e[0], e[2])),
-                                                   sorted(after, key=lambda e: (e[col], e[2])))), default=0)
-    ok = same_payload and len(after) == len(out) and worst < tol
-    report.update(applied=sorted(steps), backup=backup, events_after=len(after), events_same_payload=same_payload,
-                  max_position_error=round(worst, 6), unit=unit, item_length=round(new_len, 3))
-    if "timing" in steps and moves:
-        report["timing_after"] = onset_deviation(parse_notes(after, [e[4] for e in after]), grid)
-    print(f"verify: {len(after)} events (was {len(events)}), payload as planned={same_payload}, "
-          f"max position error {worst:.6f} {unit}")
+    same = sorted((e[0], e[1], e[2]) for e in out) == sorted((e[0], e[1], e[2]) for e in after)
+    n_after = len(parse(after, [e[3] for e in after])[0])
+    ok = same and len(after) == len(out)
+    report.update(applied=[f["id"] for f in chosen], backup=backup, events_after=len(after),
+                  notes_before=len(notes), notes_after=n_after, events_as_planned=same)
+    print(f"verify: {len(after)} events (was {len(events)}), notes {len(notes)} -> {n_after}, as planned={same}")
     result(mode="apply", ok=ok, **report)
     sys.exit(0 if ok else 1)
 finally:

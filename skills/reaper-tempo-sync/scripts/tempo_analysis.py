@@ -1,107 +1,144 @@
 """
-tempo_analysis.py - find the played pulse/bars of a freely played (rubato) performance and
+tempo_analysis.py - find the played beats and bars of a freely played (rubato) performance and
 build a tempo map that puts DAW beats on the played beats.
 
-Input is DAW-agnostic: note onsets in seconds plus sustain-pedal (CC64) events.
+Input is DAW-agnostic: notes in seconds plus sustain-pedal (CC64) events.
 Used by tempo_sync.py (live REAPER via MCP).
+
+How: a bar-pointer model (as in probabilistic beat/downbeat trackers) decoded with Viterbi over
+the whole piece at once. State = (subdivision period, position in the bar). Between two onsets
+the model picks how many subdivisions passed and how the tempo drifted; costs:
+  - timing fit of the gap to a whole number of subdivisions,
+  - tempo drift (smooth rubato is cheap, jumps are expensive),
+  - distance to the piece's main pulse (stops the classic double/half tempo errors and carries
+    the tempo through slow passages with few notes, e.g. a prelude of long chords),
+  - downbeat evidence (new bass note, sustain pedal re-press, full chord) wants beat 1,
+  - bars of another length (2..6 beats) are allowed but expensive.
 """
 import math, statistics
 
-W_SMOOTH, W_REF, W_ANCHOR, W_RESTART, W_ZERO, W_PICKUP = 4.0, 2.0, 3.0, 2.5, 6.0, 1.0
+ORNAMENT = 0.42          # onsets closer than this many main-pulse periods after the previous one are not on the grid
+SIG, TAU = 0.09, 0.035   # timing noise (log ratio), tempo drift per subdivision (log)
+W_PRIOR, W_K = 0.6, 0.6  # pull to the main pulse (per pulse of time), cost per subdivision
+W_DOWN, W_STRONG, W_OFF, W_PICKUP = 2.0, 0.6, 1.2, 3.0
+BEAM = 600
 
 
-def analyze(notes, pedal=(), slots_per_beat=2, beats_per_bar=4, per_bar=False, cluster_sec=0.035):
-    """
-    notes: [(start_sec, end_sec, pitch, velocity)]
-    pedal: [(time_sec, value)] CC64 events
-    Returns dict: tempo_points [[time, bpm, num, den, linear]], grid [(qn, sec)],
-                  bars [(start_slot, beats)], sec_to_qn(fn), report(dict)
-    """
-    SPB, BPB = slots_per_beat, beats_per_bar
-    SPBAR = SPB * BPB
-    notes = sorted(notes)
+def main_pulse(times):
+    """Most common gap between onsets in 0.12..0.7 s (log histogram mode)."""
+    g = [b - a for a, b in zip(times, times[1:]) if 0.12 <= b - a <= 0.7]
+    if len(g) < 8: raise ValueError("not enough notes to detect a pulse")
+    cands = [0.12 * 1.02 ** k for k in range(90) if 0.12 * 1.02 ** k <= 0.7]
+    best = max(cands, key=lambda c: sum(math.exp(-(math.log(x / c) / 0.07) ** 2) for x in g))
+    return statistics.median([x for x in g if abs(math.log(x / best)) < 0.2])
 
-    # ---------- onset clusters (chords / rolled notes) ----------
+
+def onset_groups(notes, pedal, cluster_sec):
+    """Onsets (chords) with downbeat evidence D and relative strength S."""
     ons = []
     for s, e, p, v in notes:
         if ons and s - ons[-1]["t"] < cluster_sec: ons[-1]["notes"].append((p, v, e - s))
         else: ons.append({"t": s, "notes": [(p, v, e - s)]})
-    if len(ons) < 4:
+    presses = [t for (t0, v0), (t, v) in zip([(-1, 0)] + pedal, pedal) if v0 < 64 <= v]
+    vs = [sum(v for _, v, _ in o["notes"]) for o in ons]
+    med = statistics.median(vs) if vs else 1
+    prev_bass = None
+    for o, v in zip(ons, vs):
+        p, _, d = min(o["notes"])
+        D = 0.0
+        if p <= 55 and d >= 0.5:                       # a held bass note (G3 or lower)
+            D += 1.0 + (0.5 if p != prev_bass else 0.0)
+            prev_bass = p
+        if any(-0.1 <= r - o["t"] <= 0.35 for r in presses): D += 0.8
+        if len(o["notes"]) >= 3: D += 0.3
+        o["D"], o["S"] = D, min(v / med, 3.0)
+    return ons
+
+
+def track(ons, anchor, SPB, BPB):
+    """Viterbi bar-pointer decoding. Returns (kept onsets with "slot", bar start slots)."""
+    L0 = SPB * BPB
+    alt = {b * SPB: (0.0 if b == BPB else 8.0 + 2.0 * abs(b - BPB)) for b in range(2, 7)}
+    alt.setdefault(L0, 0.0)
+    pmax = max(alt)
+    kept = [ons[0]]
+    for o in ons[1:]:
+        if o["t"] - kept[-1]["t"] < ORNAMENT * anchor:
+            if len(kept) > 1 and o["D"] + o["S"] > kept[-1]["D"] + kept[-1]["S"] + 1.5: kept[-1] = o
+            continue
+        kept.append(o)
+    P = [0.08 * 1.03 ** k for k in range(300) if 0.08 * 1.03 ** k <= 1.2]
+    P = [p for p in P if 0.45 * anchor <= p <= 2.2 * anchor]
+    lp = [math.log(p) for p in P]
+    prior = [((x - math.log(anchor)) / 0.35) ** 2 for x in lp]
+
+    def emit(o, pos):
+        if pos == 0: return -W_DOWN * o["D"] - W_STRONG * o["S"]
+        if pos % SPB == 0:
+            half = pos * 2 == L0
+            return -W_STRONG * o["S"] * (0.6 if half else 0.4) - (0.5 * o["D"] if half else 0.0)
+        return W_OFF * o["D"]
+
+    cost = {(i, pos): prior[i] + (0.0 if pos == 0 else W_PICKUP) + emit(kept[0], pos)
+            for i in range(len(P)) for pos in range(L0)}
+    back = []
+    for j in range(1, len(kept)):
+        ioi = kept[j]["t"] - kept[j - 1]["t"]
+        new, bp = {}, {}
+        for (i, pos), c in sorted(cost.items(), key=lambda kv: kv[1])[:BEAM]:
+            for i2 in range(max(0, i - 2), min(len(P), i + 3)):
+                x = ioi / P[i2]
+                for k in {max(1, math.floor(x)), max(1, math.ceil(x))}:
+                    base = (c + (math.log(x / k) / SIG) ** 2 + ((lp[i2] - lp[i]) / (TAU * math.sqrt(k))) ** 2
+                            + W_K * k + W_PRIOR * prior[i2] * ioi / anchor)
+                    end = pos + k
+                    opts = [((end - L) % L0, lc, L) for L, lc in alt.items() if pos < L <= end]
+                    if end < pmax: opts.append((end, 0.0, None))
+                    for npos, lc, L in opts:
+                        if npos >= pmax: continue
+                        tot = base + lc + emit(kept[j], npos)
+                        if tot < new.get((i2, npos), 1e300):
+                            new[(i2, npos)] = tot; bp[(i2, npos)] = ((i, pos), k, L)
+        if not new: raise ValueError(f"no consistent pulse around {kept[j]['t']:.2f}s")
+        cost = new; back.append(bp)
+    s = min(cost, key=cost.get)
+    path, steps = [s], []
+    for bp in reversed(back):
+        prev, k, L = bp[s]; steps.append((k, L)); s = prev; path.append(s)
+    path.reverse(); steps.reverse()
+    # absolute slots + every bar line (also those between two onsets)
+    slot = path[0][1]
+    kept[0]["slot"] = slot
+    starts = [0]
+    for j, ((k, L), (i, pos)) in enumerate(zip(steps, path[:-1]), 1):
+        if L is not None:
+            b = slot - pos + L
+            while b <= slot + k:
+                starts.append(b); b += L0
+        slot += k
+        kept[j]["slot"] = slot
+    return kept, starts
+
+
+def analyze(notes, pedal=(), slots_per_beat=2, beats_per_bar=4, per_bar=False, cluster_sec=0.05, pulse_sec=None):
+    """
+    notes: [(start_sec, end_sec, pitch, velocity)]
+    pedal: [(time_sec, value)] CC64 events
+    pulse_sec: main subdivision period; detected from the whole piece when None
+    Returns dict: tempo_points [[time, bpm, num, den, linear]], grid [(qn, sec)],
+                  bar_beats, bar_start_qn, sec_to_qn(fn), report(dict)
+    """
+    SPB, BPB = slots_per_beat, beats_per_bar
+    SPBAR = SPB * BPB
+    notes = sorted(notes)
+    all_ons = onset_groups(notes, sorted(pedal), cluster_sec)
+    if len(all_ons) < 8:
         raise ValueError("not enough notes to detect a pulse")
-    gaps = [b["t"] - a["t"] for a, b in zip(ons, ons[1:])]
-    g_med = statistics.median(gaps)
-
-    # ---------- downbeat evidence: sustained notes + pedal re-press ----------
-    lens = sorted(l for o in ons for _, _, l in o["notes"])
-    long_thr = 0.6 * lens[int(len(lens) * 0.97)]
-    pedal = sorted(pedal)
-    repress = [t for (t0, v0), (t, v) in zip(pedal, pedal[1:]) if v0 < 64 <= v and t - t0 < 0.6]
-    for o in ons:
-        ev = 0.0
-        if any(l >= long_thr for _, _, l in o["notes"]): ev += 1.0
-        if any(-0.15 <= r - o["t"] <= 0.5 for r in repress): ev += 0.6
-        o["ev"] = ev
-
-    # ---------- local reference pulse ----------
-    for k, o in enumerate(ons):
-        w = [g for g in gaps[max(0, k - 10):k + 10] if g > 0.5 * g_med]
-        o["uref"] = statistics.median(w) if w else g_med
-
-    # ---------- DP: assign every onset to a subdivision slot ----------
-    NMAX = 4 * SPB + 1
-    INF = float("inf")
-    # (phase, n_slots_from_prev) -> (cost, backptr, bar_restart). The first onset may sit on
-    # any phase (pickup / anacrusis); starting on the downbeat is preferred.
-    layer = {(ph, 1): (0.0 if ph == 0 else W_PICKUP + W_ANCHOR * ons[0]["ev"], None, False)
-             for ph in range(SPBAR)}
-    hist = [layer]
-    for k in range(1, len(ons)):
-        g = ons[k]["t"] - ons[k - 1]["t"]; ur = ons[k]["uref"]
-        nl = {}
-        for (ph, n0), (c0, _, _) in layer.items():
-            u_prev = (ons[k - 1]["t"] - ons[k - 2]["t"]) / n0 if (k >= 2 and n0 > 0) else ons[k - 1]["uref"]
-            for n in range(0, NMAX + 1):
-                if n == 0:
-                    if g > 0.4 * ur: continue
-                    c = W_ZERO * (g / ur)
-                else:
-                    u = g / n
-                    c = W_SMOOTH * math.log(u / u_prev) ** 2 + W_REF * math.log(u / ur) ** 2
-                raw = ph + n
-                opts = [(raw % SPBAR, False, 0.0)]
-                if raw % SPB == 0 and SPBAR // 2 <= raw < SPBAR:      # shortened bar ends here
-                    opts.append((0, True, W_RESTART))
-                for nph, rs, rc in opts:
-                    cc = c0 + c + rc + (W_ANCHOR * ons[k]["ev"] if nph != 0 else 0.0)
-                    key = (nph, n)
-                    if cc < nl.get(key, (INF,))[0]: nl[key] = (cc, (ph, n0), rs)
-        layer = nl; hist.append(layer)
-    state = min(layer, key=lambda s_: layer[s_][0])
-    path = []
-    for k in range(len(ons) - 1, -1, -1):
-        c, bp, rs = hist[k][state]
-        path.append((state, rs)); state = bp if bp else state
-    path.reverse()
-    pickup = path[0][0][0]                 # phase of the first onset (0 = starts on a downbeat)
-    slot = pickup; marks = [0]
-    ons[0]["slot"] = pickup
-    for k in range(1, len(ons)):
-        (ph, n), rs = path[k]
-        slot += n; ons[k]["slot"] = slot
-        if rs: marks.append(slot)
-
-    # ---------- bars: regular bars between restarts ----------
+    anchor = pulse_sec or main_pulse([o["t"] for o in all_ons])
+    ons, starts = track(all_ons, anchor, SPB, BPB)
+    pickup = ons[0]["slot"]
     last_slot = ons[-1]["slot"]
-    starts = []
-    for j, m in enumerate(marks):
-        nxt = marks[j + 1] if j + 1 < len(marks) else None
-        s_ = m
-        while True:
-            starts.append(s_)
-            if nxt is None:
-                if s_ + SPBAR > last_slot: break
-            elif s_ + SPBAR >= nxt: break
-            s_ += SPBAR
+    while starts[-1] + SPBAR <= last_slot: starts.append(starts[-1] + SPBAR)
     bars = [(s_, ((starts[j + 1] if j + 1 < len(starts) else s_ + SPBAR) - s_) // SPB)
             for j, s_ in enumerate(starts)]
 
@@ -143,6 +180,8 @@ def analyze(notes, pedal=(), slots_per_beat=2, beats_per_bar=4, per_bar=False, c
         # music starts after 0s: lead-in of whole beats at the opening tempo, as a short bar
         # (remainder) plus full bars, so the first played downbeat is a bar line
         lead_beats = max(1, round(t0 / (beat_times[1] - beat_times[0])))
+        if not pickup:                     # starts on a downbeat: lead-in of whole bars
+            lead_beats = BPB * max(1, round(lead_beats / BPB))
         beat_times = [t0 * k / lead_beats for k in range(lead_beats)] + beat_times
         rem, full = lead_beats % BPB, lead_beats // BPB
         bar_beats = ([rem] if rem else []) + [BPB] * full + bar_beats
@@ -185,7 +224,8 @@ def analyze(notes, pedal=(), slots_per_beat=2, beats_per_bar=4, per_bar=False, c
                 ti = t0_ + (ideal_q - q0) * (t1 - t0_) / (q1 - q0); break
         devms.append((o["t"] - ti) * 1000)
     report = {
-        "notes": len(notes), "onsets": len(ons),
+        "notes": len(notes), "onsets": len(all_ons), "grid_onsets": len(ons),
+        "main_pulse_sec": round(anchor, 4), "main_bpm": round(60.0 / anchor / SPB, 1),
         "bars": len(bar_beats), "lead_in_bars": lead_bar_count, "lead_in_beats": lead_beats,
         "pickup_beats": bar_beats[lead_bar_count] if pickup else 0,
         "first_note_sec": round(ons[0]["t"], 4),

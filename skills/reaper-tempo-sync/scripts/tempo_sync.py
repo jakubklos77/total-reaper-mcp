@@ -22,6 +22,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--item", type=int, default=0, help="project-wide media item index")
 ap.add_argument("--slots-per-beat", type=int, default=2, help="played subdivision per beat (2=eighths, 3=triplets, 4=16ths)")
 ap.add_argument("--beats-per-bar", type=int, default=4)
+ap.add_argument("--bpm", type=float, help="main tempo (beats per minute) if the detected one is wrong (e.g. double/half)")
 ap.add_argument("--per-bar", action="store_true", help="one tempo marker per bar (smoother, beats inside bars not exact)")
 mode = ap.add_mutually_exclusive_group()
 mode.add_argument("--apply", action="store_true", help="write tempo map + events (default is a dry run)")
@@ -83,10 +84,13 @@ try:
     pedal = [(e[3], int(e[2][4:6], 16)) for e in events
              if len(e[2]) == 6 and int(e[2][0:2], 16) & 0xF0 == 0xB0 and e[2][2:4] == "40"]
     try:
-        res = analyze(notes, pedal, a.slots_per_beat, a.beats_per_bar, a.per_bar)
+        res = analyze(notes, pedal, a.slots_per_beat, a.beats_per_bar, a.per_bar,
+                      pulse_sec=60.0 / a.bpm / a.slots_per_beat if a.bpm else None)
     except ValueError as e:
         result(mode="error", error=str(e)); sys.exit(2)
     rep = res["report"]
+    print(f"main tempo {rep['main_bpm']} BPM (one {['', 'beat', 'eighth', 'triplet', 'sixteenth'][min(a.slots_per_beat, 4)]} every {rep['main_pulse_sec']} s)")
+    print(f"irregular bars [bar, beats]: {rep['irregular_bars']}")
     print(f"{rep['notes']} notes, {rep['bars']} bars, BPM {rep['bpm_min']}-{rep['bpm_max']} "
           f"(median {rep['bpm_median']}), {rep['tempo_points']} tempo markers")
     print("per-bar BPM:", rep["per_bar_bpm"])

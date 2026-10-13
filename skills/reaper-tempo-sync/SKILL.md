@@ -10,9 +10,8 @@ it sounds**: a tempo marker goes on every played beat (square shape), and all ev
 written back at their original absolute times. Afterwards beats/bars match the notes, so
 quantising, editing, notation and adding other parts work against the real pulse.
 
-**Pipeline with reaper-performance-cleanup:** remove thinking pauses and slips *before* this
-skill (`cleanup.py --apply notes,pauses`), and tighten timing *after* it (`--apply timing`).
-A pause would otherwise show up here as a very slow beat or extra bars.
+**Pipeline with reaper-performance-cleanup:** fix slips, ghosts and split chords *before* this
+skill (`cleanup.py --apply`), so stray onsets don't distort the beat detection.
 
 ## Requirements
 
@@ -44,8 +43,12 @@ A pause would otherwise show up here as a very slow beat or extra bars.
    The last line is `RESULT {json}`. Show the user: bars, BPM range/median, per-bar BPM,
    irregular bars (`[bar_number, beats]`, e.g. a 2/4 bar before a final chord), pickup and
    lead-in, and `onset_grid_dev_ms_median` (≈0 means beats sit on the notes). Sanity-check:
-   per-bar BPM should move smoothly; one bar far off its neighbours (e.g. 2× or ½) usually
-   means the wrong subdivision or meter - try another `--slots-per-beat`/`--beats-per-bar`.
+   - `main tempo` is the pulse of the whole piece (the most common onset gap). If it is
+     double or half what the user feels, re-run with `--bpm <their tempo>`.
+   - per-bar BPM should move smoothly; one bar far off its neighbours (e.g. 2× or ½) usually
+     means the wrong subdivision or meter - try another `--slots-per-beat`/`--beats-per-bar`.
+   - irregular bars: each one is a place where the played phrase was longer/shorter than the
+     meter (in an improvisation often an added or dropped beat). Show them with their times.
 
 4. **Apply** after the user agrees:
    ```bash
@@ -65,12 +68,18 @@ A pause would otherwise show up here as a very slow beat or extra bars.
   by tens of ms. Default per-beat is exact; offer per-bar only if the user wants a cleaner
   tempo lane.
 - `--force`: replace an existing tempo map (otherwise the script refuses).
-- **How bars are found:** every onset is assigned to a subdivision slot by a global optimizer
-  (tempo smoothness + local tempo), with downbeat evidence from long/sustained notes and
-  sustain-pedal re-presses. Short bars (e.g. 2/4) are inserted only where the evidence
-  demands it, and become time-signature changes in REAPER.
+- **How beats and bars are found:** a bar-pointer model decoded with Viterbi over the whole
+  piece at once (state = subdivision period + position in the bar). Costs: fit of each onset
+  gap to whole subdivisions, smooth tempo drift, pull towards the piece's main pulse, and
+  downbeat evidence (new held bass note, sustain-pedal re-press, full chord) wanting beat 1.
+  The main-pulse pull is what keeps slow passages with few notes (a prelude of long chords) in
+  the main tempo instead of turning them into double/half tempo or very slow bars. Bars of
+  2..6 beats are allowed but expensive, and become time-signature changes in REAPER.
+- **Ornaments** (onsets closer than ~0.4 pulses after the previous one: grace notes, fast
+  16ths) are not used as grid anchors; they keep their exact time like everything else.
+- **Lead-in:** silence before a first note that falls on a downbeat becomes whole bars.
 - **Pickup:** if the music starts before the first downbeat, the first bar becomes a short
-  bar (e.g. 1/4). **Late start:** silence before the first note becomes whole lead-in beats
+  bar (e.g. 1/4). **Late start:** silence before the first note becomes lead-in beats (whole bars when the music starts on a downbeat)
   at the opening tempo. If a pickup would start before 0 s, the script stops and says how
   far to move the item right.
 - Simultaneous chord notes (within 35 ms) count as one onset; muted notes are ignored for
